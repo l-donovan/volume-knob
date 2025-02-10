@@ -17,4 +17,4 @@ target = "riscv32imac-unknown-none-elf"
 build-std = ["core", "alloc"]
 
 [env]
-ESP_LOG = "INFO"
+ESP_LOG = "TRACE"
