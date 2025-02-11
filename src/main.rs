@@ -1,10 +1,9 @@
 #![no_std]
 #![no_main]
 
+mod hid;
 mod hid_descriptor;
 mod led;
-
-use core::cell::RefCell;
 
 use bleps::{
     Addr, Ble, HciConnector,
@@ -12,9 +11,10 @@ use bleps::{
         AD_FLAG_LE_LIMITED_DISCOVERABLE, AdStructure, BR_EDR_NOT_SUPPORTED, create_advertising_data,
     },
     att::Uuid,
-    attribute_server::{AttributeServer, NotificationData, WorkResult},
+    attribute_server::{AttributeServer, WorkResult},
     gatt,
 };
+use core::{cell::RefCell, cmp::min};
 use esp_backtrace as _;
 use esp_hal::{
     clock::CpuClock,
@@ -28,6 +28,7 @@ use esp_hal::{
 };
 use esp_hal_smartled::{SmartLedsAdapter, smartLedBuffer};
 use esp_wifi::ble::controller::BleConnector;
+use hid::{MediaKeys, SendsKeypresses};
 use hid_descriptor::{HID_REPORT, HID_REPORT_INPUT1_ID};
 use led::{Colorable, hue};
 use log::info;
@@ -41,10 +42,6 @@ const BATTERY_FORMAT: &[u8] = &[0x04, 0x00, 0x27, 0xad, 0x01, 0x00, 0x00];
 const REPORT_REFERENCE: &[u8] = &[HID_REPORT_INPUT1_ID, 0x01];
 // HID spec version 0x0101 (u16), country (u8), flags (u8)
 const HID_INFO: &[u8] = &[0x01, 0x01, 0x00, 0x02];
-
-fn min(a: usize, b: usize) -> usize {
-    if a < b { a } else { b }
-}
 
 fn write(offset: usize, dst: &mut [u8], src: &[u8]) -> usize {
     let bytes_to_read = min(dst.len(), src.len() - offset);
@@ -82,7 +79,7 @@ fn main() -> ! {
         .inspect_err(|_| led.set_hue(hue::RED))
         .unwrap();
 
-    info!("Successfully initialized WiFi controller");
+    info!("Initialized WiFi controller");
 
     let button = Input::new(peripherals.GPIO9, Pull::Down);
     let mut debounce_cnt = 500;
@@ -138,38 +135,16 @@ fn main() -> ! {
         led.set_hue(hue::GREEN);
 
         // Define our read/write closures
-
-        let mut hid_info_read = |offset: usize, data: &mut [u8]| write(offset, data, &HID_INFO);
+        let mut hid_info_read = |o: usize, d: &mut [u8]| write(o, d, &HID_INFO);
+        let mut battery_format_read = |o: usize, d: &mut [u8]| write(o, d, &BATTERY_FORMAT);
+        let mut report_reference_read = |o: usize, d: &mut [u8]| write(o, d, &REPORT_REFERENCE);
+        let mut report_map_read = |o: usize, d: &mut [u8]| write(o, d, &HID_REPORT);
+        let mut battery_level_read = |o: usize, d: &mut [u8]| write(o, d, &[0x50]);
+        let mut input_report_read = |o: usize, d: &mut [u8]| write(o, d, &[0b00000001]);
 
         let mut hid_control_write = |offset: usize, data: &[u8]| {
-            // uint8_t* const ctrl_point_ref = (uint8_t* const)&ctrl_point;
-            // const uint8_t new_ctrl_pnt = *((const uint8_t *) buf);
-
-            // /* Validate flags */
-            // if (!(flags & BT_GATT_WRITE_FLAG_CMD))
-            // {
-            //     /* Only write without response accepted */
-            //     return BT_GATT_ERR(BT_ATT_ERR_WRITE_REQ_REJECTED);
-            // }
-
-            // /* Validate length */
-            // if ((offset + len) > sizeof(ctrl_point))
-            // {
-            //     return BT_GATT_ERR(BT_ATT_ERR_INVALID_OFFSET);
-            // }
-
-            // /* Validate value */
-            // if (new_ctrl_pnt >= HIDS_CONTROL_POINT_N)
-            // {
-            //     return BT_GATT_ERR(BT_ATT_ERR_NOT_SUPPORTED);
-            // }
-
-            // memcpy(ctrl_point_ref + offset, data, len);
-
-            // return len;
+            // TODO
         };
-
-        let mut report_map_read = |offset: usize, data: &mut [u8]| write(offset, data, &HID_REPORT);
 
         // Protocol mode might actually be one measly Byte
         let protocol_mode = RefCell::new([0u8; 128]);
@@ -191,16 +166,6 @@ fn main() -> ! {
             *len = data.len();
             mode[..*len].copy_from_slice(&data[offset..offset + *len]);
         };
-
-        let mut battery_level_read = |offset: usize, data: &mut [u8]| write(offset, data, &[0x50]);
-
-        let mut battery_format_read =
-            |offset: usize, data: &mut [u8]| write(offset, data, &BATTERY_FORMAT);
-
-        let mut input_report_read = |offset: usize, data: &mut [u8]| write(offset, data, &[0xe9]);
-
-        let mut report_reference_read =
-            |offset: usize, data: &mut [u8]| write(offset, data, &REPORT_REFERENCE);
 
         gatt!([
             service {
@@ -287,8 +252,6 @@ fn main() -> ! {
         srv.set_pin_callback(Some(&mut pin_callback));
 
         loop {
-            let mut notification = None;
-
             if button.is_low() && debounce_cnt > 0 {
                 debounce_cnt -= 1;
 
@@ -300,18 +263,22 @@ fn main() -> ! {
                         0,
                         &mut cccd,
                     ) {
-                        info!("{cccd:#?}");
-                        // if notifications enabled
+                        // If notifications enabled
                         if cccd[0] == 1 {
                             led.set_hue(hue::RED);
                             delay.delay_millis(50);
                             led.set_hue(hue::GREEN);
                             delay.delay_millis(50);
 
-                            notification = Some(NotificationData::new(
-                                input_report_characteristic_handle,
-                                &[0b00000001],
-                            ));
+                            if srv.press(input_report_characteristic_handle, MediaKeys::PlayPause) {
+                                break;
+                            };
+
+                            delay.delay_millis(50);
+
+                            if srv.clear(input_report_characteristic_handle) {
+                                break;
+                            }
                         }
                     }
                 }
@@ -321,11 +288,7 @@ fn main() -> ! {
                 debounce_cnt = 500;
             }
 
-            if let Some(ref not) = notification {
-                info!("Notification: {not:#?}");
-            }
-
-            match srv.do_work_with_notification(notification) {
+            match srv.do_work_with_notification(None) {
                 Ok(res) => {
                     if let WorkResult::GotDisconnected = res {
                         break;

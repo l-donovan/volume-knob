@@ -687,6 +687,7 @@ dependencies = [
 name = "esp32"
 version = "0.1.0"
 dependencies = [
+ "bitflags",
  "bleps",
  "esp-alloc",
  "esp-backtrace",
