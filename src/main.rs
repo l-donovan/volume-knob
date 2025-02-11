@@ -4,10 +4,12 @@
 mod hid_descriptor;
 mod led;
 
+use core::cell::RefCell;
+
 use bleps::{
     Addr, Ble, HciConnector,
     ad_structure::{
-        AdStructure, BR_EDR_NOT_SUPPORTED, LE_GENERAL_DISCOVERABLE, create_advertising_data,
+        AD_FLAG_LE_LIMITED_DISCOVERABLE, AdStructure, BR_EDR_NOT_SUPPORTED, create_advertising_data,
     },
     att::Uuid,
     attribute_server::{AttributeServer, NotificationData, WorkResult},
@@ -26,18 +28,29 @@ use esp_hal::{
 };
 use esp_hal_smartled::{SmartLedsAdapter, smartLedBuffer};
 use esp_wifi::ble::controller::BleConnector;
-use hid_descriptor::{HID_REPORT, HID_REPORT_INPUT1_ID, HID_REPORT_INPUT1_SIZE, HID_REPORT_SIZE};
+use hid_descriptor::{HID_REPORT, HID_REPORT_INPUT1_ID};
 use led::{Colorable, hue};
-use log::{info, warn};
+use log::info;
 
 // 0x02, vid (u16), pid (u16), version (u16)
 const DEVICE_INFO: &[u8] = &[0x02, 0x37, 0x13, 0x37, 0x13, 0x37, 0x13];
 const DEVICE_MANUFACTURER: &[u8] = b"Luke Enterprises";
 // format (u8), exponent (i8), unit (u16), namespace (u8), description (u16)
 const BATTERY_FORMAT: &[u8] = &[0x04, 0x00, 0x27, 0xad, 0x01, 0x00, 0x00];
-
 // report ID (u8), input 0x01/output 0x02/feature 0x03 (u8)
 const REPORT_REFERENCE: &[u8] = &[HID_REPORT_INPUT1_ID, 0x01];
+// HID spec version 0x0101 (u16), country (u8), flags (u8)
+const HID_INFO: &[u8] = &[0x01, 0x01, 0x00, 0x02];
+
+fn min(a: usize, b: usize) -> usize {
+    if a < b { a } else { b }
+}
+
+fn write(offset: usize, dst: &mut [u8], src: &[u8]) -> usize {
+    let bytes_to_read = min(dst.len(), src.len() - offset);
+    dst[..bytes_to_read].copy_from_slice(&src[offset..offset + bytes_to_read]);
+    bytes_to_read
+}
 
 #[main]
 fn main() -> ! {
@@ -66,10 +79,7 @@ fn main() -> ! {
 
     // Initialize the WiFi system
     let wifi_controller = esp_wifi::init(timer_group_0.timer0, trng.rng, peripherals.RADIO_CLK)
-        .inspect_err(|e| {
-            led.set_hue(hue::RED);
-            panic!("Error initializing WiFi controller: {:#?}", e);
-        })
+        .inspect_err(|_| led.set_hue(hue::RED))
         .unwrap();
 
     info!("Successfully initialized WiFi controller");
@@ -87,30 +97,21 @@ fn main() -> ! {
         let hci = HciConnector::new(connector, now);
         let mut ble = Ble::new(&hci);
 
-        ble.init()
-            .inspect_err(|e| {
-                led.set_hue(hue::RED);
-                warn!("Failed to initialize BLE: {:#?}", e);
-            })
-            .unwrap();
+        ble.init().inspect_err(|_| led.set_hue(hue::RED)).unwrap();
 
         let local_addr = Addr::from_le_bytes(false, ble.cmd_read_br_addr().unwrap());
 
         ble.cmd_set_le_advertising_parameters()
-            .inspect_err(|e| {
-                led.set_hue(hue::RED);
-                warn!("Failed to set LE advertising parameters: {:#?}", e);
-            })
+            .inspect_err(|_| led.set_hue(hue::RED))
             .unwrap();
 
         let advertising_data = create_advertising_data(&[
-            AdStructure::Flags(LE_GENERAL_DISCOVERABLE | BR_EDR_NOT_SUPPORTED),
-            // HID and Device Information
-            // per https://bitbucket.org/bluetooth-SIG/public/src/main/assigned_numbers/uuids/service_uuids.yaml
+            AdStructure::Flags(AD_FLAG_LE_LIMITED_DISCOVERABLE | BR_EDR_NOT_SUPPORTED),
+            // See https://bitbucket.org/bluetooth-SIG/public/src/main/assigned_numbers/uuids/service_uuids.yaml
             AdStructure::ServiceUuids16(&[
-                // Uuid::Uuid16(0x180a),
-                // Uuid::Uuid16(0x180f),
-                Uuid::Uuid16(0x1812),
+                Uuid::Uuid16(0x1812), // HID
+                Uuid::Uuid16(0x180f), // Battery
+                Uuid::Uuid16(0x180a), // Device information
             ]),
             AdStructure::CompleteLocalName("vKnob"),
             AdStructure::ManufacturerSpecificData {
@@ -122,58 +123,84 @@ fn main() -> ! {
                 data: &[0xc1, 0x03], // Keyboard
             },
         ])
-        .inspect_err(|e| {
-            led.set_hue(hue::RED);
-            warn!("Failed to create advertising data: {:#?}", e);
-        })
+        .inspect_err(|_| led.set_hue(hue::RED))
         .unwrap();
 
         ble.cmd_set_le_advertising_data(advertising_data)
-            .inspect_err(|e| {
-                led.set_hue(hue::RED);
-                warn!("Failed to set advertising data: {:#?}", e);
-            })
+            .inspect_err(|_| led.set_hue(hue::RED))
             .unwrap();
 
         ble.cmd_set_le_advertise_enable(true)
-            .inspect_err(|e| {
-                led.set_hue(hue::RED);
-                warn!("Failed to enable advertising: {:#?}", e);
-            })
+            .inspect_err(|_| led.set_hue(hue::RED))
             .unwrap();
 
         info!("Started advertising");
         led.set_hue(hue::GREEN);
 
-        // HID spec version 0x0111 (u16), country (u8), flags (u8)
-        let mut hid_info_read = |offset: usize, data: &mut [u8]| {
-            data[..4].copy_from_slice(&[0x11, 0x01, 0x00, 0x02]);
-            4
+        // Define our read/write closures
+
+        let mut hid_info_read = |offset: usize, data: &mut [u8]| write(offset, data, &HID_INFO);
+
+        let mut hid_control_write = |offset: usize, data: &[u8]| {
+            // uint8_t* const ctrl_point_ref = (uint8_t* const)&ctrl_point;
+            // const uint8_t new_ctrl_pnt = *((const uint8_t *) buf);
+
+            // /* Validate flags */
+            // if (!(flags & BT_GATT_WRITE_FLAG_CMD))
+            // {
+            //     /* Only write without response accepted */
+            //     return BT_GATT_ERR(BT_ATT_ERR_WRITE_REQ_REJECTED);
+            // }
+
+            // /* Validate length */
+            // if ((offset + len) > sizeof(ctrl_point))
+            // {
+            //     return BT_GATT_ERR(BT_ATT_ERR_INVALID_OFFSET);
+            // }
+
+            // /* Validate value */
+            // if (new_ctrl_pnt >= HIDS_CONTROL_POINT_N)
+            // {
+            //     return BT_GATT_ERR(BT_ATT_ERR_NOT_SUPPORTED);
+            // }
+
+            // memcpy(ctrl_point_ref + offset, data, len);
+
+            // return len;
         };
 
-        let mut report_map_read = |offset: usize, data: &mut [u8]| {
-            data[..HID_REPORT_SIZE].copy_from_slice(&HID_REPORT);
-            HID_REPORT_SIZE
-        };
+        let mut report_map_read = |offset: usize, data: &mut [u8]| write(offset, data, &HID_REPORT);
 
-        let mut hid_control_write = |offset: usize, data: &[u8]| {};
+        // Protocol mode might actually be one measly Byte
+        let protocol_mode = RefCell::new([0u8; 128]);
+        let protocol_mode_len = RefCell::new(1usize);
 
         let mut protocol_mode_read = |offset: usize, data: &mut [u8]| {
-            data[0] = 0x01;
-            1
+            info!("Protocol mode read called with offset {offset}");
+            let mode = protocol_mode.borrow();
+            let len = *protocol_mode_len.borrow();
+            let bytes_to_read = min(data.len(), len - offset);
+            data[..bytes_to_read].copy_from_slice(&mode[offset..offset + bytes_to_read]);
+            bytes_to_read
         };
 
-        let mut protocol_mode_write = |offset: usize, data: &[u8]| {};
-
-        let mut battery_level_read = |offset: usize, data: &mut [u8]| {
-            data[0] = 0x50;
-            1
+        let mut protocol_mode_write = |offset: usize, data: &[u8]| {
+            info!("Protocol mode write was called with offset {offset} and data {data:#?}");
+            let mut mode = protocol_mode.borrow_mut();
+            let mut len = protocol_mode_len.borrow_mut();
+            *len = data.len();
+            mode[..*len].copy_from_slice(&data[offset..offset + *len]);
         };
 
-        let mut input_report_read = |offset: usize, data: &mut [u8]| {
-            data[..HID_REPORT_INPUT1_SIZE].copy_from_slice(&[0xe9]);
-            HID_REPORT_INPUT1_SIZE
-        };
+        let mut battery_level_read = |offset: usize, data: &mut [u8]| write(offset, data, &[0x50]);
+
+        let mut battery_format_read =
+            |offset: usize, data: &mut [u8]| write(offset, data, &BATTERY_FORMAT);
+
+        let mut input_report_read = |offset: usize, data: &mut [u8]| write(offset, data, &[0xe9]);
+
+        let mut report_reference_read =
+            |offset: usize, data: &mut [u8]| write(offset, data, &REPORT_REFERENCE);
 
         gatt!([
             service {
@@ -198,25 +225,20 @@ fn main() -> ! {
                     uuid: "2a19",
                     notify: true, // This automatically creates a 0x2902 descriptor
                     read: battery_level_read,
-                    // // I can't explain why this breaks things, but it does.
-                    // descriptors: [descriptor {
-                    //     uuid: "2904", // Characteristic presentation format
-                    //     value: BATTERY_FORMAT
-                    // }]
+                    descriptors: [descriptor {
+                        uuid: "2904", // Presentation format
+                        read: battery_format_read,
+                    }]
                 }],
             },
             service {
                 uuid: "1812", // HID
                 characteristics: [
+                    // These characteristics are required for all HID devices
                     characteristic {
                         name: "hid_info_characteristic",
                         uuid: "2a4a",
                         read: hid_info_read,
-                    },
-                    characteristic {
-                        name: "report_map_characteristic",
-                        uuid: "2a4b",
-                        read: report_map_read,
                     },
                     characteristic {
                         name: "hid_control_characteristic",
@@ -224,20 +246,27 @@ fn main() -> ! {
                         write: hid_control_write,
                     },
                     characteristic {
+                        name: "report_map_characteristic",
+                        uuid: "2a4b",
+                        read: report_map_read,
+                    },
+                    // This characteristic does... something
+                    characteristic {
+                        name: "protocol_mode_characteristic",
+                        uuid: "2a4e",
+                        read: protocol_mode_read,
+                        write: protocol_mode_write,
+                    },
+                    // This characteristic is responsible for actually sending the data to the host
+                    characteristic {
                         name: "input_report_characteristic",
                         uuid: "2a4d",
                         notify: true, // This automatically creates a 0x2902 descriptor
                         read: input_report_read,
                         descriptors: [descriptor {
                             uuid: "2908", // Report reference
-                            value: REPORT_REFERENCE,
+                            read: report_reference_read,
                         }],
-                    },
-                    characteristic {
-                        name: "protocol_mode_characteristic",
-                        uuid: "2a4e",
-                        read: protocol_mode_read,
-                        write: protocol_mode_write,
                     },
                 ],
             },
