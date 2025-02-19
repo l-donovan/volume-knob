@@ -1,0 +1,6 @@
+(sym_lib_table
+  (version 7)
+  (lib (name "LESD5D5.0CT1G")(type "KiCad")(uri "${KIPRJMOD}/resources/LESD5D5.0CT1G.kicad_sym")(options "")(descr ""))
+  (lib (name "SGM2212-3_3XKC3G_TR")(type "KiCad")(uri "${KIPRJMOD}/resources/SGM2212-3_3XKC3G_TR.kicad_sym")(options "")(descr ""))
+  (lib (name "BC847BDW1T1G")(type "KiCad")(uri "${KIPRJMOD}/resources/BC847BDW1T1G.kicad_sym")(options "")(descr ""))
+)
