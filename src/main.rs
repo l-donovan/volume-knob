@@ -1,6 +1,7 @@
 #![no_std]
 #![no_main]
 
+mod button;
 mod hid;
 mod hid_descriptor;
 mod led;
@@ -14,11 +15,11 @@ use bleps::{
     attribute_server::{AttributeServer, WorkResult},
     gatt,
 };
+use button::Button;
 use core::{cell::RefCell, cmp::min};
 use esp_backtrace as _;
 use esp_hal::{
     clock::CpuClock,
-    delay::Delay,
     gpio::{Input, Pull},
     main,
     rmt::Rmt,
@@ -60,7 +61,6 @@ fn main() -> ! {
     let freq = 80.MHz();
     let rmt = Rmt::new(peripherals.RMT, freq).unwrap();
     let mut trng = Trng::new(peripherals.RNG, peripherals.ADC1);
-    let delay = Delay::new();
 
     // We use one of the RMT channels to instantiate a `SmartLedsAdapter` which can
     // be used directly with all `smart_led` implementations
@@ -81,8 +81,7 @@ fn main() -> ! {
 
     info!("Initialized WiFi controller");
 
-    let button = Input::new(peripherals.GPIO9, Pull::Down);
-    let mut debounce_cnt = 500;
+    let mut play_pause_button = Button::new(Input::new(peripherals.GPIO9, Pull::Down));
     let mut bluetooth = peripherals.BT;
 
     let now = || time::now().duration_since_epoch().to_millis();
@@ -252,51 +251,24 @@ fn main() -> ! {
         srv.set_pin_callback(Some(&mut pin_callback));
 
         loop {
-            if button.is_low() && debounce_cnt > 0 {
-                debounce_cnt -= 1;
-
-                if debounce_cnt == 0 {
-                    let mut cccd = [0u8; 1];
-
-                    if let Some(1) = srv.get_characteristic_value(
-                        input_report_characteristic_notify_enable_handle,
-                        0,
-                        &mut cccd,
-                    ) {
-                        // If notifications enabled
-                        if cccd[0] == 1 {
-                            led.set_hue(hue::RED);
-                            delay.delay_millis(50);
-                            led.set_hue(hue::GREEN);
-                            delay.delay_millis(50);
-
-                            if srv.press(input_report_characteristic_handle, MediaKeys::PlayPause) {
-                                break;
-                            };
-
-                            delay.delay_millis(50);
-
-                            if srv.clear(input_report_characteristic_handle) {
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-
-            if button.is_high() {
-                debounce_cnt = 500;
+            if play_pause_button.when_pressed(|| {
+                srv.send_keypress(
+                    input_report_characteristic_notify_enable_handle,
+                    input_report_characteristic_handle,
+                    MediaKeys::PlayPause,
+                )
+            }) {
+                break;
             }
 
             match srv.do_work_with_notification(None) {
-                Ok(res) => {
-                    if let WorkResult::GotDisconnected = res {
-                        break;
-                    }
+                Ok(WorkResult::GotDisconnected) => {
+                    break;
                 }
                 Err(err) => {
                     info!("{:?}", err);
                 }
+                _ => {}
             }
 
             ltk = srv.get_ltk();

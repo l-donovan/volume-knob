@@ -18,28 +18,48 @@ bitflags! {
 }
 
 pub trait SendsKeypresses {
-    fn press(&mut self, handle: u16, keys: MediaKeys) -> bool;
-    fn clear(&mut self, handle: u16) -> bool;
+    fn send_keypress(&mut self, notify_handle: u16, data_handle: u16, keys: MediaKeys) -> bool;
 }
 
 impl<'a, 'b> SendsKeypresses for AttributeServer<'a, Trng<'b>> {
-    fn press(&mut self, handle: u16, keys: MediaKeys) -> bool {
-        match self.do_work_with_notification(Some(NotificationData::new(handle, &[keys.bits()]))) {
-            Ok(res) => {
-                if let WorkResult::GotDisconnected = res {
-                    true
-                } else {
-                    false
-                }
-            }
-            Err(err) => {
-                info!("{:?}", err);
-                false
-            }
-        }
-    }
+    fn send_keypress(&mut self, notify_handle: u16, data_handle: u16, keys: MediaKeys) -> bool {
+        let mut cccd = [0u8; 1];
 
-    fn clear(&mut self, handle: u16) -> bool {
-        self.press(handle, MediaKeys::Clear)
+        if let Some(1) = self.get_characteristic_value(notify_handle, 0, &mut cccd) {
+            // Should this be (cccd[0] & 0xb00000001) == 0 or something similar?
+            if cccd[0] != 1 {
+                return false;
+            }
+
+            // Press
+            match self
+                .do_work_with_notification(Some(NotificationData::new(data_handle, &[keys.bits()])))
+            {
+                Ok(WorkResult::GotDisconnected) => {
+                    return true;
+                }
+                Err(err) => {
+                    info!("{:?}", err);
+                }
+                _ => {}
+            };
+
+            // Clear
+            match self.do_work_with_notification(Some(NotificationData::new(data_handle, &[0]))) {
+                Ok(WorkResult::GotDisconnected) => {
+                    return true;
+                }
+                Err(err) => {
+                    info!("{:?}", err);
+                }
+                _ => {}
+            };
+
+            // NOTE: We can only clear all keypresses, because we don't maintain the current
+            // keypress state, nor would it be appropriate for AtttributeServer to have
+            // ownership.
+        };
+
+        return false;
     }
 }
